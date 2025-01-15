@@ -18,19 +18,24 @@ from typing import Any, List, Optional, Sequence
 import yaml
 from rdkit import Chem
 
+from syntheseus.interface.models import ReactionType
 from syntheseus.interface.molecule import Molecule
-from syntheseus.interface.reaction import ReactionMetaData, SingleProductReaction
-from syntheseus.reaction_prediction.inference.base import ExternalBackwardReactionModel
+from syntheseus.interface.reaction import ReactionMetaData
+from syntheseus.reaction_prediction.inference.base import ExternalReactionModel
 from syntheseus.reaction_prediction.utils.inference import (
     get_unique_file_in_dir,
-    process_raw_smiles_outputs_backwards,
+    process_raw_smiles_outputs_backwards, process_raw_smiles_outputs_forwards,
 )
 
 
-class RootAlignedModel(ExternalBackwardReactionModel):
+class RootAlignedModel(ExternalReactionModel):
+    def is_forward(self) -> bool:
+        return self._is_forward
+
     def __init__(
         self,
         *args,
+        is_forward: bool = False,
         num_augmentations: int = 20,
         probability_from_score_temperature: Optional[float] = 2.0,
         **kwargs,
@@ -41,6 +46,7 @@ class RootAlignedModel(ExternalBackwardReactionModel):
         - `model_dir` contains the model checkpoint as the only `*.pt` file
         - `model_dir` contains the config as the only `*.yml` file
         """
+        self._is_forward = is_forward
         super().__init__(*args, **kwargs)
 
         # Parse arguments for calling external functions from `root_aligned/OpenNMT.py`.
@@ -82,8 +88,16 @@ class RootAlignedModel(ExternalBackwardReactionModel):
         """Map `Molecule`s into SMILES bytes."""
         from root_aligned.score import smi_tokenizer
 
-        # Example outcome: b'C C ( = O ) c 1 c c c 2 c ( c c n 2 C ( = O ) O C ( C ) ( C ) C ) c 1\n'.
-        return [bytes(smi_tokenizer(input.smiles) + "\n", "utf-8") for input in inputs]
+
+        if self.is_forward():
+            result = []
+            for augmented_reactants in inputs:
+                s = smi_tokenizer(".".join(molecule.smiles for molecule in augmented_reactants))
+                result.append(bytes(s + "\n", "utf-8"))
+            return result
+        else:
+            # Example outcome: b'C C ( = O ) c 1 c c c 2 c ( c c n 2 C ( = O ) O C ( C ) ( C ) C ) c 1\n'.
+            return [bytes(smi_tokenizer(input.smiles) + "\n", "utf-8") for input in inputs]
 
     def _build_kwargs_from_scores(self, scores: List[float]) -> List[ReactionMetaData]:
         """Compute kwargs to save in the predictions given raw scores from the RootAligned model.
@@ -149,48 +163,12 @@ class RootAlignedModel(ExternalBackwardReactionModel):
 
     def _get_reactions(
         self, inputs, num_results: int, random_augmentation=False
-    ) -> List[Sequence[SingleProductReaction]]:
+    ) -> List[Sequence[ReactionType]]:
         # Step 1: Perform data augmentation.
-        augmented_inputs = []
-        if random_augmentation:
-            for input in inputs:
-                augmented_inputs.append(input)
-                for i in range(self.num_augmentations - 1):
-                    randomized_smi = Chem.MolToSmiles(input.rdkit_mol, doRandom=True)
-                    randomized_mol = Molecule(smiles=randomized_smi, canonicalize=False)
-                    augmented_inputs.append(randomized_mol)
+        if self.is_forward():
+            augmented_inputs = self._perform_augmentation_forward(inputs[0])
         else:
-            from root_aligned.preprocessing.generate_PtoR_data import clear_map_canonical_smiles
-
-            for input in inputs:
-                product_atom_map_numbers = [i + 1 for i in range(input.rdkit_mol.GetNumAtoms())]
-                max_times = len(product_atom_map_numbers)
-                product_roots = [-1]
-                times = min(self.num_augmentations, max_times)
-                if times < self.num_augmentations:  # times = max_times
-                    product_roots.extend(product_atom_map_numbers)
-                    product_roots.extend(
-                        random.choices(product_roots, k=self.num_augmentations - len(product_roots))
-                    )
-                else:  # times = num_augmentations
-                    while len(product_roots) < times:
-                        product_roots.append(random.sample(product_atom_map_numbers, 1)[0])
-                        if product_roots[-1] in product_roots[:-1]:
-                            product_roots.pop()
-                times = len(product_roots)
-                assert times == self.num_augmentations
-                for k in range(times):
-                    pro_root_atom_map = product_roots[k]
-                    pro_root = pro_root_atom_map - 1
-                    if pro_root_atom_map <= 0:
-                        pro_root = -1
-                    pro_smi = clear_map_canonical_smiles(
-                        input.smiles, canonical=True, root=pro_root
-                    )
-                    randomized_mol = Molecule(smiles=pro_smi, canonicalize=False)
-                    augmented_inputs.append(randomized_mol)
-
-        assert len(augmented_inputs) == len(inputs) * self.num_augmentations
+            augmented_inputs = self._perform_augmentation_retro(inputs, random_augmentation)
 
         # Step 2: Map from `Molecule`s to SMILES bytes to align with `root_aligned/OpenNMT.py`.
         augmented_batch = self._mols_to_batch(augmented_inputs)
@@ -249,9 +227,119 @@ class RootAlignedModel(ExternalBackwardReactionModel):
             ranked_results.append([item[0][0] for item in rank])  # Output reactant SMILES.
             ranked_scores.append([item[1] for item in rank])  # Output scores used for ranking.
 
+        if self.is_forward():
+            return [
+                process_raw_smiles_outputs_forwards(
+                    input, outputs, self._build_kwargs_from_scores(scores)
+                )
+                for input, outputs, scores in zip(inputs, ranked_results, ranked_scores)
+            ]
         return [
             process_raw_smiles_outputs_backwards(
                 input, outputs, self._build_kwargs_from_scores(scores)
             )
             for input, outputs, scores in zip(inputs, ranked_results, ranked_scores)
         ]
+
+    def _perform_augmentation_retro(self, inputs, random_augmentation):
+        augmented_inputs = []
+        if random_augmentation:
+            for input in inputs:
+                augmented_inputs.append(input)
+                for i in range(self.num_augmentations - 1):
+                    randomized_smi = Chem.MolToSmiles(input.rdkit_mol, doRandom=True)
+                    randomized_mol = Molecule(smiles=randomized_smi, canonicalize=False)
+                    augmented_inputs.append(randomized_mol)
+        else:
+            from root_aligned.preprocessing.generate_PtoR_data import clear_map_canonical_smiles
+
+            for input in inputs:
+                product_atom_map_numbers = [i + 1 for i in range(input.rdkit_mol.GetNumAtoms())]
+                max_times = len(product_atom_map_numbers)
+                product_roots = [-1]
+                times = min(self.num_augmentations, max_times)
+                if times < self.num_augmentations:  # times = max_times
+                    product_roots.extend(product_atom_map_numbers)
+                    product_roots.extend(
+                        random.choices(product_roots, k=self.num_augmentations - len(product_roots))
+                    )
+                else:  # times = num_augmentations
+                    while len(product_roots) < times:
+                        product_roots.append(random.sample(product_atom_map_numbers, 1)[0])
+                        if product_roots[-1] in product_roots[:-1]:
+                            product_roots.pop()
+                times = len(product_roots)
+                assert times == self.num_augmentations
+                for k in range(times):
+                    pro_root_atom_map = product_roots[k]
+                    pro_root = pro_root_atom_map - 1
+                    if pro_root_atom_map <= 0:
+                        pro_root = -1
+                    pro_smi = clear_map_canonical_smiles(
+                        input.smiles, canonical=True, root=pro_root
+                    )
+                    randomized_mol = Molecule(smiles=pro_smi, canonicalize=False)
+                    augmented_inputs.append(randomized_mol)
+
+        assert len(augmented_inputs) == len(inputs) * self.num_augmentations
+
+        return augmented_inputs
+
+    def _perform_augmentation_forward(self, inputs):
+        from root_aligned.preprocessing.generate_RtoP_data import clear_map_canonical_smiles
+
+        # Создаем список для хранения аугментаций
+        augmented_reactants_by_iteration = []
+
+        # Получаем количество аугментаций
+        reactant_atom_map_numbers_list = [
+            [i + 1 for i in range(input.rdkit_mol.GetNumAtoms())] for input in inputs
+        ]
+        max_times_list = [len(product_atom_map_numbers) for product_atom_map_numbers in reactant_atom_map_numbers_list]
+
+        # Проверяем, сколько итераций аугментации нужно делать
+        times = min(self.num_augmentations, max(max_times_list))
+
+        # Проходим по каждой итерации аугментации
+        for k in range(times):
+            iteration_augmentations = []
+
+            # Проходим по каждому входному реагенту
+            for idx, input in enumerate(inputs):
+                reactant_atom_map_numbers = reactant_atom_map_numbers_list[idx]
+                max_times = max_times_list[idx]
+                reactant_roots = [-1]
+
+                # Генерация массива корней (augmented points) для текущего реагента
+                if times < self.num_augmentations:
+                    reactant_roots.extend(reactant_atom_map_numbers)
+                    reactant_roots.extend(
+                        random.choices(reactant_roots, k=self.num_augmentations - len(reactant_roots))
+                    )
+                else:
+                    while len(reactant_roots) < self.num_augmentations:
+                        reactant_roots.append(random.sample(reactant_atom_map_numbers, 1)[0])
+                        if reactant_roots[-1] in reactant_roots[:-1]:
+                            reactant_roots.pop()
+
+                assert len(reactant_roots) == self.num_augmentations
+
+                # Для текущей итерации выбираем корень
+                pro_root_atom_map = reactant_roots[k]
+                pro_root = pro_root_atom_map - 1
+                if pro_root_atom_map <= 0:
+                    pro_root = -1
+
+                # Канонизация SMILES и создание молекулы
+                pro_smi = clear_map_canonical_smiles(
+                    input.smiles, canonical=True, root=pro_root
+                )
+                randomized_mol = Molecule(smiles=pro_smi, canonicalize=False)
+
+                # Сохраняем текущую аугментацию для данного реагента
+                iteration_augmentations.append(randomized_mol)
+
+            # Добавляем аугментацию текущей итерации в итоговый список
+            augmented_reactants_by_iteration.append(iteration_augmentations)
+
+        return augmented_reactants_by_iteration
