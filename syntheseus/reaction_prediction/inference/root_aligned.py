@@ -288,26 +288,22 @@ class RootAlignedModel(ExternalReactionModel):
     def _perform_augmentation_forward(self, inputs):
         from root_aligned.preprocessing.generate_RtoP_data import clear_map_canonical_smiles
 
-        # Создаем список для хранения аугментаций
         augmented_reactants_by_iteration = []
 
-        # Получаем количество аугментаций
         reactant_atom_map_numbers_list = [
             [i + 1 for i in range(input.rdkit_mol.GetNumAtoms())] for input in inputs
         ]
         max_times_list = [len(product_atom_map_numbers) for product_atom_map_numbers in reactant_atom_map_numbers_list]
 
-        # Проверяем, сколько итераций аугментации нужно делать
-        times = min(self.num_augmentations, max(max_times_list))
+        min_times = min(self.num_augmentations, max(max_times_list))
 
-        # Проходим по каждой итерации аугментации
-        for k in range(times):
+        for k in range(min_times):
             iteration_augmentations = []
 
-            # Проходим по каждому входному реагенту
             for idx, input in enumerate(inputs):
                 reactant_atom_map_numbers = reactant_atom_map_numbers_list[idx]
                 max_times = max_times_list[idx]
+                times = min(self.num_augmentations, max_times)
                 reactant_roots = [-1]
 
                 # Генерация массива корней (augmented points) для текущего реагента
@@ -336,10 +332,8 @@ class RootAlignedModel(ExternalReactionModel):
                 )
                 randomized_mol = Molecule(smiles=pro_smi, canonicalize=False)
 
-                # Сохраняем текущую аугментацию для данного реагента
                 iteration_augmentations.append(randomized_mol)
 
-            # Добавляем аугментацию текущей итерации в итоговый список
             augmented_reactants_by_iteration.append(iteration_augmentations)
 
         return augmented_reactants_by_iteration
